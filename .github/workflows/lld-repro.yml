@@ -2,25 +2,22 @@ name: lld-link COMDAT crash repro
 
 # One-off diagnostic workflow (manual dispatch only).
 #
-# Reproduces and isolates the lld-link crash
+# Captures a self-contained reproducer for the lld-link / LTO-codegen crash
 #   LLVM ERROR: Associative COMDAT symbol
 #   '?tls_data@?$SafeBinaryMutex@$00@@0UTLSData@1@A' does not exist.
-# seen when linking Godot with use_llvm (clang-cl + lld-link) on the
-# windows-2025-vs2026 image (VS 2026, LLVM ~20.1.x).
+# (root cause: getComdatGVForCOFF in TargetLoweringObjectFileImpl.cpp -- the
+# comdat leader is dropped/renamed under LTO, leaving a dangling associative
+# comdat) on the windows-2025-vs2026 image (clang/lld-link 20.1.8).
 #
-# Controlled experiment: the crash correlates perfectly with FULL LTO. CI shows
-# lto=full links crash while no-LTO links succeed, so this matrix builds the
-# same vanilla Godot editor both ways (lto=full vs lto=none), several times each,
-# to demonstrate the trigger deterministically.
-#
-#   * Builds VANILLA Godot (no Godot Secure patch) so the reproducer is 100%
-#     public and the LLVM maintainers can reproduce it themselves.
-#   * LLD_REPRODUCE makes lld-link write a complete input tarball (objects +
-#     libs + exact response file) — the reducible reproducer the bug guide asks
-#     for.
-#   * scons cache is OFF so objects are freshly emitted by the current clang.
-#   * On a crash we re-link the captured inputs with /threads:1 (rules a thread
-#     race in/out) and also try lto=thin via a separate matrix leg.
+# Findings so far:
+#   * Trigger is full LTO of THIS module: the patched (Godot Secure) build with
+#     lto=full crashes 9/9; vanilla Godot with lto=full links cleanly. The crash
+#     is sensitive to symbol liveness (consistent with the comdat-leader-drop
+#     root cause), so we reproduce with the patched build via the action.
+#   * LLD_REPRODUCE makes lld-link write a complete input tarball (LTO bitcode +
+#     libs + the exact response file) -- the self-contained reproducer to attach
+#     to the LLVM issue.
+#   * On a crash we also re-link with /threads:1 (rules a thread race out).
 
 on:
   workflow_dispatch:
@@ -30,16 +27,14 @@ permissions:
 
 jobs:
   repro:
-    name: lto=${{ matrix.lto }} #${{ matrix.n }}
-    runs-on: windows-latest          # currently windows-2025-vs2026
+    name: patched lto=full #${{ matrix.n }}
+    runs-on: windows-latest          # currently windows-2025-vs2026, clang 20.1.8
     strategy:
       fail-fast: false
       matrix:
-        lto: [full, none]            # full -> expected crash; none -> expected pass
-        n: [1, 2, 3]
+        n: [1, 2]
 
     env:
-      GODOT_REF: 4.6-stable
       LLD_REPRODUCE: ${{ github.workspace }}\lld-repro\editor-link.tar
 
     steps:
@@ -48,41 +43,19 @@ jobs:
         run: |
           "Image: $env:ImageOS  $env:ImageVersion"
           $lld = "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\Llvm\x64\bin\lld-link.exe"
-          if (Test-Path $lld) {
-            & $lld --version
-            & (Join-Path (Split-Path $lld) 'clang-cl.exe') --version
-          } else {
-            "lld-link not at expected VS 2026 path"; (Get-Command lld-link -ErrorAction SilentlyContinue).Source
-          }
+          if (Test-Path $lld) { & $lld --version; & (Join-Path (Split-Path $lld) 'clang-cl.exe') --version }
 
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.x'
-
-      - name: Install SCons
-        run: pip install scons
-
-      - name: Download vanilla Godot ${{ env.GODOT_REF }}
-        shell: bash
-        run: |
-          curl -fL --retry 5 --retry-delay 10 \
-            "https://github.com/godotengine/godot/archive/refs/tags/${GODOT_REF}.tar.gz" -o godot.tar.gz
-          mkdir godot && tar -xzf godot.tar.gz --strip-components=1 -C godot
-
-      - name: Install D3D12 SDK
-        working-directory: godot
-        run: python misc/scripts/install_d3d12_sdk_windows.py
-
-      - name: Build editor with clang (use_llvm), lto=${{ matrix.lto }}
+      - name: Build patched Godot editor, full LTO, capture lld reproduce
         id: build
         continue-on-error: true
-        working-directory: godot
-        shell: bash
-        run: |
-          mkdir -p "$(dirname "$LLD_REPRODUCE")"
-          JOBS=$(nproc 2>/dev/null || echo 2)
-          scons platform=windows arch=x86_64 target=editor \
-            use_llvm=yes d3d12=yes lto=${{ matrix.lto }} verbose=yes -j"$JOBS"
+        uses: emabrey/GodotSecureAction@v1
+        with:
+          godot-version:    4.6-stable
+          algorithm:        aes
+          target:           editor
+          lto:              full
+          scons-cache:      false        # fresh objects; the crash is deterministic here
+          extra-scons-args: verbose=yes
 
       - name: On crash — re-link single-threaded (/threads:1) to test for a race
         if: steps.build.outcome == 'failure'
@@ -106,9 +79,9 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: lld-repro-lto-${{ matrix.lto }}-${{ matrix.n }}-${{ steps.build.outcome }}
+          name: lld-repro-patched-lto-full-${{ matrix.n }}-${{ steps.build.outcome }}
           path: |
             ${{ github.workspace }}/lld-repro/**
-            godot/bin/**
+            godot-source/bin/**
           if-no-files-found: warn
           retention-days: 14

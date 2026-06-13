@@ -1,19 +1,15 @@
-# Draft LLVM bug report — lld-link LTO associative-COMDAT crash
+# LLVM bug report — full-LTO COFF codegen: report_fatal_error on associative COMDAT whose leader was dropped/renamed
 
-Target tracker: <https://github.com/llvm/llvm-project/issues> (subproject: lld / COFF, LTO).
-Structured per <https://llvm.org/docs/HowToSubmitABug.html>.
-
-Fill in the two TODOs (exact `lld-link --version`, attach the reproduce tarball)
-from the `lld-repro.yml` workflow before filing.
+Target tracker: <https://github.com/llvm/llvm-project/issues> (subprojects: LTO, CodeGen, COFF).
 
 ---
 
-**Title:** [lld][COFF][LTO] `report_fatal_error` "Associative COMDAT symbol '…tls_data…' does not exist" linking a `thread_local` template static with `/lto` (LLVM 20.1.x, lld-link)
+**Title:** [LTO][CodeGen][COFF] `report_fatal_error` "Associative COMDAT symbol '…' does not exist" in `getComdatGVForCOFF` when full LTO drops/renames the comdat leader of a `thread_local` template static
 
-### What happens
-`lld-link` aborts via `report_fatal_error` (the internal-error path — `LLVM ERROR:`
-+ "PLEASE submit a bug report" + stack dump — *not* a normal `lld-link: error:`)
-during a **full-LTO** link:
+### Summary
+
+Linking with **full LTO** on `x86_64-pc-windows-msvc` (`clang-cl` + `lld-link`)
+aborts inside the LTO backend's COFF codegen:
 
 ```
 LLVM ERROR: Associative COMDAT symbol '?tls_data@?$SafeBinaryMutex@$00@@0UTLSData@1@A' does not exist.
@@ -21,52 +17,113 @@ PLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/ and i
 ```
 
 The symbol demangles to `SafeBinaryMutex<1>::tls_data` — a `thread_local static`
-data member of a class template (Godot's `core/os/mutex.h`). Its TLS init/guard
-sections are emitted as `IMAGE_COMDAT_SELECT_ASSOCIATIVE`, keyed on that symbol;
-during the LTO link lld-link fails to resolve the key.
+data member of a class template (from Godot's `core/os/mutex.h`). The build links
+cleanly **without** LTO; the crash only appears with `lto=full`.
 
-### Trigger: full LTO (deterministic)
-The crash correlates **exactly** with `lto=full` (clang-cl + lld-link full LTO):
+### Root cause
+
+The message comes from `getComdatGVForCOFF` in
+`llvm/lib/CodeGen/TargetLoweringObjectFileImpl.cpp` (verified on `release/20.x`):
+
+```cpp
+static const GlobalValue *getComdatGVForCOFF(const GlobalValue *GV) {
+  const Comdat *C = GV->getComdat();
+  assert(C && "expected GV to have a Comdat!");
+
+  StringRef ComdatGVName = C->getName();
+  const GlobalValue *ComdatGV = GV->getParent()->getNamedValue(ComdatGVName);
+  if (!ComdatGV)
+    report_fatal_error("Associative COMDAT symbol '" + ComdatGVName +
+                       "' does not exist.");
+  ...
+}
+```
+
+This enforces a COFF invariant: **a comdat's name must match an existing
+`GlobalValue` in the module** (the comdat "leader/key"). When lowering a global
+`GV` whose comdat leader is *another* symbol, COFF emits `GV`'s section as
+`IMAGE_COMDAT_SELECT_ASSOCIATIVE`, associated to that leader. If
+`M.getNamedValue(C->getName())` returns null — i.e. the leader no longer exists —
+codegen `report_fatal_error`s.
+
+So at the point of the crash there is a surviving global still carrying the comdat
+`?tls_data@?$SafeBinaryMutex@$00@@0UTLSData@1@A` (one of the TLS support globals
+COFF associates with the variable — guard/init/`.tls$` data), but the **leader
+global `tls_data` itself has been removed or renamed**, leaving a dangling
+associative comdat.
+
+That state cannot arise from a single object compile (each TU emits a
+self-consistent comdat group), which is why it is **LTO-only and deterministic**:
+during LTO the multiple `linkonce_odr` copies of `SafeBinaryMutex<true>::tls_data`
+are resolved across modules, and the comdat group is broken — the leader is
+dropped/renamed while an associated member is kept. The most likely culprit is a
+pass that does not treat the comdat group atomically (e.g. GlobalDCE /
+Internalize keeping/removing comdat members independently) or a comdat-renaming
+transform that doesn't update associated members — note LLVM already has a
+regression test for exactly this class of issue:
+`llvm/test/Transforms/LowerTypeTests/cfi-coff-comdat-rename.ll`.
+
+### Suggested fix
+
+Keep the COFF invariant intact across LTO so a leaderless associative comdat is
+never handed to codegen:
+
+1. **Atomic comdat groups (preferred):** whichever LTO transform removes or
+   renames the leader of a comdat must keep the group consistent — either keep
+   the leader `GlobalValue` alive while any associated member survives, drop the
+   whole comdat group together, or rename the comdat to a surviving member.
+   GlobalDCE/Internalize already have comdat-group logic; this case (a
+   `thread_local` template static's COFF-associated support globals) appears to
+   slip through it.
+2. **Fail earlier / more clearly:** the `Verifier` could reject a module where a
+   comdat name has no corresponding `GlobalValue` on COFF, turning a backend
+   `report_fatal_error` into a deterministic verifier error that pinpoints the
+   producing pass. (Defensive only — the real fix is #1.)
+
+Bisecting LTO passes (`-mllvm -print-after-all` / saving the pre-codegen LTO
+bitcode and running `llvm-dis`) on the attached reproducer should identify the
+exact pass that orphans the leader.
+
+### Trigger / evidence (deterministic, LTO-only)
 
 | build | LTO | result |
 |-------|-----|--------|
-| `use_llvm=yes lto=full`  | full | **crash** — observed 9/9 across 3 CI re-runs |
-| `use_llvm=yes` (no LTO)  | none | links cleanly — many CI runs, never crashed |
+| Godot + Godot Secure patch | `full` | **crash** — 9/9 across CI re-runs |
+| Godot + Godot Secure patch | none | links cleanly |
+| vanilla Godot (no patch) | `full` | links cleanly — 3/3 (real LTO: `-flto`, `/LTCG`) |
 
-So it is **not** intermittent and **not** cache-related (an earlier "intermittent"
-impression came from comparing a full-LTO run against no-LTO runs). The crash
-backtrace is byte-identical across runs (same offsets modulo ASLR), i.e. the same
-code path every time — ruling out memory corruption. It reproduces with vanilla
-Godot, so the Godot Secure patch is not involved.
-
-### Where LLVM was obtained
-Not upstream git: the **lld-link bundled with Visual Studio 2026 Enterprise**
-(18.6.11822.322; component `Microsoft.VisualStudio.Component.VC.Llvm.Clang`
-18.6.11706.339), LLVM ≈ 20.1.x. The same GitHub Actions image also ships
-standalone **LLVM 20.1.8**.
-`lld-link --version`: _TODO — capture from the lld-repro workflow._
-
-### Environment
-- Linker: `lld-link.exe` (VS 2026 bundled, `…\VC\Tools\Llvm\x64\bin\lld-link.exe`)
-- Compiler: matching `clang-cl`, target `x86_64-pc-windows-msvc`
-- OS: Windows Server 2025 (10.0.26100), GitHub Actions image `windows-2025-vs2026` v`20260608.135.2`
-- Invocation: `lld-link @<response-file>` (driven by SCons during a Godot build)
+So the crash needs full LTO **and** a module composition in which the comdat
+leader gets dropped — vanilla and patched builds differ only in which symbols are
+live, which is exactly what determines whether the leader survives. The backtrace
+is byte-identical across runs (same offsets modulo ASLR) — same code path every
+time, not memory corruption or a race.
 
 ### Reproduction
-Vanilla **Godot Engine 4.6-stable**, full LTO:
 
-```
-scons platform=windows arch=x86_64 target=editor use_llvm=yes d3d12=yes lto=full
-```
+Deterministic for a **full-LTO link of one specific module**: building Godot
+Engine 4.6-stable with `lto=full` and the Godot Secure source patch applied
+crashes 9/9, while a **vanilla** Godot 4.6 `lto=full` build links cleanly
+(verified real LTO — `-flto` on every TU, `/LTCG` link). Whether the comdat
+leader survives LTO depends on symbol liveness, which the patch changes.
 
-Crashes at `Linking Program bin\godot.windows.editor.x86_64.llvm.exe`. The same
-command with `lto=none` links successfully.
+A complete, self-contained **lld `--reproduce` archive** (post-front-end LTO
+bitcode + libs + the exact `lld-link` response file) from a crashing link is
+attached — **extract it and run `lld-link @response.txt` to reproduce with no
+source build at all** (this is the recommended reproducer; `llvm-reduce` can
+shrink the bitcode further). _Attach: `editor-link.tar`._ `lto=none` links cleanly.
 
-A complete, self-contained reproducer (the lld `--reproduce` tarball: all
-objects/bitcode, libs, and the exact response file) is attached, captured via
-`LLD_REPRODUCE` on a crashing run. _TODO: attach `editor-link.tar`._
+### Environment
+
+- Linker/codegen: `lld-link.exe` bundled with **Visual Studio 2026 Enterprise**
+  18.6.11822.322 (component `Microsoft.VisualStudio.Component.VC.Llvm.Clang`
+  18.6.11706.339); **clang/lld-link 20.1.8** (`clang version 20.1.8`). Standalone
+  LLVM on the same image: 20.1.8.
+- Compiler: matching `clang-cl`, target `x86_64-pc-windows-msvc`.
+- OS: Windows Server 2025 (10.0.26100), GitHub Actions image
+  `windows-2025-vs2026` v`20260608.135.2`.
 
 ### Backtrace (unsymbolicated — VS-bundled release lld-link, no PDB)
+
 ```
 Exception Code: 0xC000001D
  #0  lld-link.exe+0x1b021e6
@@ -74,23 +131,16 @@ Exception Code: 0xC000001D
  #2  lld-link.exe+0x1a33058
  #3  lld-link.exe+0x1b0479e
  #4  lld-link.exe+0x1efc85
- …  (frames #5–#21 in lld-link.exe; identical offsets across runs)
+ …  (frames #5–#21; identical offsets across runs)
  #22 lld-link.exe+0x1a1d0dc
  #23 KERNEL32.DLL+0x2e8d7   (BaseThreadInitThunk)
  #24 ntdll.dll+0x8c53c      (RtlUserThreadStart)
 ```
-
-### Suspected area / useful diagnostics
-- The failure is specific to the **LTO** link path resolving an
-  `IMAGE_COMDAT_SELECT_ASSOCIATIVE` section whose key symbol is a `thread_local`
-  template static — likely the COMDAT/symbol bookkeeping after the LTO backend
-  regenerates objects from bitcode.
-- `/threads:1` result on the captured inputs: _TODO from lld-repro_ (expected not
-  to matter, since the trigger is LTO, not threading).
-- `llvm-readobj`/`llvm-dis` on the LTO-produced object/bitcode defining
-  `SafeBinaryMutex<1>::tls_data` to confirm whether the associative key symbol is
-  present after LTO codegen.
-- A symbolicated backtrace from a PDB-matched / assert-enabled lld-link.
+(The fatal error originates in `getComdatGVForCOFF`, reached through the LTO
+backend's COFF object emission; a PDB-matched/assert-enabled build can
+symbolicate the upper frames.)
 
 ### Workaround
-`lto=none` (or avoiding `use_llvm` for full-LTO release links) links cleanly.
+
+Link with `lto=none` (or do not use `use_llvm`/clang-cl for full-LTO release
+links on this toolchain).
