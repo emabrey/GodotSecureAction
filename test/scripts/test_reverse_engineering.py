@@ -28,19 +28,30 @@ import subprocess
 import sys
 import tempfile
 
+# Windows consoles default to a legacy codepage (e.g. cp1252) which cannot
+# encode the ✓/✗ characters used in test output. Force UTF-8 with replacement
+# so the script never crashes with UnicodeEncodeError on any platform.
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 
 def find_tool(tool_dir: str) -> str:
     """Locate the gdre_tools or recover_project executable."""
     patterns = [
         os.path.join(tool_dir, "**", "gdre_tools"),
         os.path.join(tool_dir, "**", "gdre_tools.x86_64"),
+        os.path.join(tool_dir, "**", "gdre_tools.exe"),
         os.path.join(tool_dir, "**", "recover_project"),
+        os.path.join(tool_dir, "**", "recover_project.exe"),
         os.path.join(tool_dir, "gdre_tools"),
+        os.path.join(tool_dir, "gdre_tools.exe"),
         os.path.join(tool_dir, "recover_project"),
+        os.path.join(tool_dir, "recover_project.exe"),
     ]
     for pattern in patterns:
         matches = glob.glob(pattern, recursive=True)
-        executables = [m for m in matches if os.access(m, os.X_OK)]
+        # .exe files are executable on Windows regardless of os.access
+        executables = [m for m in matches if os.access(m, os.X_OK) or m.endswith(".exe")]
         if executables:
             return executables[0]
 
@@ -55,7 +66,7 @@ def secret_in_dir(output_dir: str, secret: str) -> str | None:
         for fname in files:
             fpath = os.path.join(root, fname)
             try:
-                with open(fpath, "r", errors="replace") as fh:
+                with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
                     if secret in fh.read():
                         return fpath
             except OSError:
@@ -75,10 +86,15 @@ def run(pck_path: str, tool_dir: str, secret: str) -> int:
         print(f"\nRunning: {' '.join(cmd)}\n")
 
         try:
+            # Explicit UTF-8 decoding: text=True alone uses the locale encoding
+            # (cp1252 on Windows), which raises UnicodeDecodeError on arbitrary
+            # tool output. errors="replace" guarantees decoding never crashes.
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=180,
             )
         except subprocess.TimeoutExpired:
