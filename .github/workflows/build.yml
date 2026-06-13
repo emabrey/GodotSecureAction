@@ -241,15 +241,24 @@ jobs:
         shell: bash
         run: |
           chmod +x godot-bundle/*
-          [ -d godot-bundle-linux ] && chmod +x godot-bundle-linux/*
+          # godot-bundle-linux only exists on macOS (cross-export). Use an if
+          # block, not `[ -d ] && chmod`: the latter is the step's last command,
+          # so on Linux (dir absent) it returns 1 and fails the bash -e step.
+          if [ -d godot-bundle-linux ]; then
+            chmod +x godot-bundle-linux/*
+          fi
 
       - name: Locate editor binary
         id: editor
         shell: bash
         run: |
+          # -perm -u+x, not -executable: the latter is a GNU find extension that
+          # macOS/BSD find does not support. Both finds accept -perm -u+x, and
+          # the prior chmod step guarantees the bit is set (artifact download
+          # does not preserve Unix exec permissions).
           case "${{ runner.os }}" in
             Windows) BIN=$(find godot-bundle -type f -name "*editor*.exe" | head -1) ;;
-            *)       BIN=$(find godot-bundle -type f -executable -name "*editor*" | head -1) ;;
+            *)       BIN=$(find godot-bundle -type f -perm -u+x -name "*editor*" | head -1) ;;
           esac
           echo "path=$BIN" >> "$GITHUB_OUTPUT"
           echo "Found editor: $BIN"
