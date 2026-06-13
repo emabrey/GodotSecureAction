@@ -1,8 +1,10 @@
 name: minimal llc COMDAT repro
 
 # One-off diagnostic (manual dispatch). Confirms the codegen crash reproduces
-# from a few lines of hand-written LLVM IR via `llc` alone — no Godot build, no
-# linker — on the same toolchain (windows-2025-vs2026, LLVM 20.1.8).
+# from a few lines of hand-written LLVM IR via `clang -c file.ll` alone — no
+# Godot build, no linker — on the same toolchain (windows-2025-vs2026, clang
+# 20.1.8). (The image ships clang/lld but not llc, so we drive codegen with
+# clang, which hits the same AsmPrinter/getComdatGVForCOFF path.)
 #
 # IR: .github/llvm-repro/comdat-leader-missing.ll — a global in a comdat whose
 # named leader GlobalValue is absent. Expected: report_fatal_error
@@ -16,39 +18,42 @@ permissions:
   contents: read
 
 jobs:
-  llc:
-    runs-on: windows-latest          # windows-2025-vs2026, LLVM 20.1.8
+  clang:
+    runs-on: windows-latest          # windows-2025-vs2026, clang 20.1.8
     steps:
       - uses: actions/checkout@v4
 
-      - name: Locate llc (image LLVM 20.1.8)
+      - name: Locate clang
         id: find
         shell: pwsh
         run: |
           "Image: $env:ImageOS  $env:ImageVersion"
-          $cands = @("C:\Program Files\LLVM\bin\llc.exe", (Get-Command llc -ErrorAction SilentlyContinue).Source) |
-                   Where-Object { $_ -and (Test-Path $_) }
-          if (-not $cands) { "::error::no llc found on the image"; exit 1 }
-          $llc = $cands[0]
-          "llc=$llc" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "Using: $llc"
-          & $llc --version | Select-String 'LLVM version'
+          $cands = @(
+            "C:\Program Files\LLVM\bin\clang.exe",
+            "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\Llvm\x64\bin\clang.exe",
+            (Get-Command clang -ErrorAction SilentlyContinue).Source
+          ) | Where-Object { $_ -and (Test-Path $_) }
+          if (-not $cands) { "::error::no clang found on the image"; exit 1 }
+          $clang = $cands[0]
+          "clang=$clang" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "Using: $clang"
+          & $clang --version | Select-Object -First 2
 
-      - name: llc with verifier (default)
+      - name: clang -c file.ll (verifier on, default)
         id: verify
         continue-on-error: true
         shell: pwsh
         run: |
-          & "${{ steps.find.outputs.llc }}" -mtriple=x86_64-pc-windows-msvc -filetype=obj `
+          & "${{ steps.find.outputs.clang }}" --target=x86_64-pc-windows-msvc -c `
             .github/llvm-repro/comdat-leader-missing.ll -o out-verify.obj 2>&1 | Tee-Object out-verify.txt
           "exit=$LASTEXITCODE"
 
-      - name: llc with -disable-verify
+      - name: clang -c file.ll (-disable-llvm-verifier)
         id: noverify
         continue-on-error: true
         shell: pwsh
         run: |
-          & "${{ steps.find.outputs.llc }}" -disable-verify -mtriple=x86_64-pc-windows-msvc -filetype=obj `
+          & "${{ steps.find.outputs.clang }}" --target=x86_64-pc-windows-msvc -Xclang -disable-llvm-verifier -c `
             .github/llvm-repro/comdat-leader-missing.ll -o out-noverify.obj 2>&1 | Tee-Object out-noverify.txt
           "exit=$LASTEXITCODE"
 
@@ -56,12 +61,12 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          "default-verify llc outcome : ${{ steps.verify.outcome }}"
-          "-disable-verify llc outcome: ${{ steps.noverify.outcome }}"
-          "--- output (default verify) ---";   Get-Content out-verify.txt   -ErrorAction SilentlyContinue
-          "--- output (-disable-verify) ---";   Get-Content out-noverify.txt -ErrorAction SilentlyContinue
-          if ((Select-String -Path out-verify.txt,out-noverify.txt -Pattern 'Associative COMDAT symbol' -ErrorAction SilentlyContinue)) {
+          "verifier-on  clang outcome: ${{ steps.verify.outcome }}"
+          "verifier-off clang outcome: ${{ steps.noverify.outcome }}"
+          "--- output (verifier on) ---";  Get-Content out-verify.txt   -ErrorAction SilentlyContinue
+          "--- output (verifier off) ---"; Get-Content out-noverify.txt -ErrorAction SilentlyContinue
+          if (Select-String -Path out-verify.txt,out-noverify.txt -Pattern 'Associative COMDAT symbol' -ErrorAction SilentlyContinue) {
             "::notice::Reproduced: getComdatGVForCOFF report_fatal_error"
           } else {
-            "::warning::Did not reproduce the COMDAT fatal error — IR may need adjustment"
+            "::warning::Did not reproduce — IR may need adjustment"
           }
