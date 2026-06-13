@@ -1,0 +1,67 @@
+name: minimal llc COMDAT repro
+
+# One-off diagnostic (manual dispatch). Confirms the codegen crash reproduces
+# from a few lines of hand-written LLVM IR via `llc` alone — no Godot build, no
+# linker — on the same toolchain (windows-2025-vs2026, LLVM 20.1.8).
+#
+# IR: .github/llvm-repro/comdat-leader-missing.ll — a global in a comdat whose
+# named leader GlobalValue is absent. Expected: report_fatal_error
+# "Associative COMDAT symbol 'missing_leader' does not exist." from
+# getComdatGVForCOFF.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  llc:
+    runs-on: windows-latest          # windows-2025-vs2026, LLVM 20.1.8
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Locate llc (image LLVM 20.1.8)
+        id: find
+        shell: pwsh
+        run: |
+          "Image: $env:ImageOS  $env:ImageVersion"
+          $cands = @("C:\Program Files\LLVM\bin\llc.exe", (Get-Command llc -ErrorAction SilentlyContinue).Source) |
+                   Where-Object { $_ -and (Test-Path $_) }
+          if (-not $cands) { "::error::no llc found on the image"; exit 1 }
+          $llc = $cands[0]
+          "llc=$llc" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "Using: $llc"
+          & $llc --version | Select-String 'LLVM version'
+
+      - name: llc with verifier (default)
+        id: verify
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "${{ steps.find.outputs.llc }}" -mtriple=x86_64-pc-windows-msvc -filetype=obj `
+            .github/llvm-repro/comdat-leader-missing.ll -o out-verify.obj 2>&1 | Tee-Object out-verify.txt
+          "exit=$LASTEXITCODE"
+
+      - name: llc with -disable-verify
+        id: noverify
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "${{ steps.find.outputs.llc }}" -disable-verify -mtriple=x86_64-pc-windows-msvc -filetype=obj `
+            .github/llvm-repro/comdat-leader-missing.ll -o out-noverify.obj 2>&1 | Tee-Object out-noverify.txt
+          "exit=$LASTEXITCODE"
+
+      - name: Summary
+        if: always()
+        shell: pwsh
+        run: |
+          "default-verify llc outcome : ${{ steps.verify.outcome }}"
+          "-disable-verify llc outcome: ${{ steps.noverify.outcome }}"
+          "--- output (default verify) ---";   Get-Content out-verify.txt   -ErrorAction SilentlyContinue
+          "--- output (-disable-verify) ---";   Get-Content out-noverify.txt -ErrorAction SilentlyContinue
+          if ((Select-String -Path out-verify.txt,out-noverify.txt -Pattern 'Associative COMDAT symbol' -ErrorAction SilentlyContinue)) {
+            "::notice::Reproduced: getComdatGVForCOFF report_fatal_error"
+          } else {
+            "::warning::Did not reproduce the COMDAT fatal error — IR may need adjustment"
+          }
