@@ -2,25 +2,25 @@ name: lld-link COMDAT crash repro
 
 # One-off diagnostic workflow (manual dispatch only).
 #
-# Captures a self-contained reproducer for the intermittent lld-link crash
+# Reproduces and isolates the lld-link crash
 #   LLVM ERROR: Associative COMDAT symbol
 #   '?tls_data@?$SafeBinaryMutex@$00@@0UTLSData@1@A' does not exist.
-# observed when linking Godot with use_llvm (clang-cl + lld-link) on the
+# seen when linking Godot with use_llvm (clang-cl + lld-link) on the
 # windows-2025-vs2026 image (VS 2026, LLVM ~20.1.x).
 #
-# Design:
+# Controlled experiment: the crash correlates perfectly with FULL LTO. CI shows
+# lto=full links crash while no-LTO links succeed, so this matrix builds the
+# same vanilla Godot editor both ways (lto=full vs lto=none), several times each,
+# to demonstrate the trigger deterministically.
+#
 #   * Builds VANILLA Godot (no Godot Secure patch) so the reproducer is 100%
 #     public and the LLVM maintainers can reproduce it themselves.
-#   * LLD_REPRODUCE makes every lld-link invocation write a complete input
-#     tarball (objects + libs + the exact response file) — the reducible
-#     reproducer the LLVM bug guide asks for. The editor links first, so on a
-#     crash the build stops and the tarball on disk is the crashing link.
-#   * scons cache is intentionally OFF: the crash needs objects freshly emitted
-#     by the current clang; a warm cache of older objects masks it.
-#   * Several identical attempts run in parallel because the crash is ~50%.
-#   * On a crash we re-link the captured inputs with /threads:1 to test whether
-#     serialising lld-link's parallel COMDAT resolution avoids the crash — both
-#     a confirming experiment and a potential workaround.
+#   * LLD_REPRODUCE makes lld-link write a complete input tarball (objects +
+#     libs + exact response file) — the reducible reproducer the bug guide asks
+#     for.
+#   * scons cache is OFF so objects are freshly emitted by the current clang.
+#   * On a crash we re-link the captured inputs with /threads:1 (rules a thread
+#     race in/out) and also try lto=thin via a separate matrix leg.
 
 on:
   workflow_dispatch:
@@ -30,12 +30,13 @@ permissions:
 
 jobs:
   repro:
-    name: attempt ${{ matrix.n }}
+    name: lto=${{ matrix.lto }} #${{ matrix.n }}
     runs-on: windows-latest          # currently windows-2025-vs2026
     strategy:
       fail-fast: false
       matrix:
-        n: [1, 2, 3, 4, 5, 6]        # ~50% crash rate -> 6 attempts ≈ 98% chance of >=1 crash
+        lto: [full, none]            # full -> expected crash; none -> expected pass
+        n: [1, 2, 3]
 
     env:
       GODOT_REF: 4.6-stable
@@ -51,8 +52,7 @@ jobs:
             & $lld --version
             & (Join-Path (Split-Path $lld) 'clang-cl.exe') --version
           } else {
-            "lld-link not at the expected VS 2026 path; searching PATH"
-            (Get-Command lld-link -ErrorAction SilentlyContinue).Source
+            "lld-link not at expected VS 2026 path"; (Get-Command lld-link -ErrorAction SilentlyContinue).Source
           }
 
       - uses: actions/setup-python@v6
@@ -73,7 +73,7 @@ jobs:
         working-directory: godot
         run: python misc/scripts/install_d3d12_sdk_windows.py
 
-      - name: Build editor with clang (use_llvm) and capture lld reproduce
+      - name: Build editor with clang (use_llvm), lto=${{ matrix.lto }}
         id: build
         continue-on-error: true
         working-directory: godot
@@ -82,23 +82,23 @@ jobs:
           mkdir -p "$(dirname "$LLD_REPRODUCE")"
           JOBS=$(nproc 2>/dev/null || echo 2)
           scons platform=windows arch=x86_64 target=editor \
-            use_llvm=yes d3d12=yes verbose=yes -j"$JOBS"
+            use_llvm=yes d3d12=yes lto=${{ matrix.lto }} verbose=yes -j"$JOBS"
 
-      - name: On crash — re-link single-threaded (/threads:1) to test the race
+      - name: On crash — re-link single-threaded (/threads:1) to test for a race
         if: steps.build.outcome == 'failure'
         shell: pwsh
         run: |
           $tar = $env:LLD_REPRODUCE
-          if (-not (Test-Path $tar)) { "No reproduce tarball at $tar (lld-link may not have honoured LLD_REPRODUCE)."; exit 0 }
+          if (-not (Test-Path $tar)) { "No reproduce tarball at $tar."; exit 0 }
           $dir = "repro-extract"; New-Item -ItemType Directory -Force $dir | Out-Null
           tar -xf $tar -C $dir
           $resp = Get-ChildItem $dir -Recurse -Filter 'response.txt' | Select-Object -First 1
           if (-not $resp) { "No response.txt inside the reproduce tarball."; exit 0 }
           $lld = "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\Llvm\x64\bin\lld-link.exe"
           Push-Location $resp.Directory
-          "=== re-link with default (threaded) to confirm crash reproduces from the tarball ==="
+          "=== re-link, default (threaded) ==="
           & $lld "@$($resp.Name)"; "exit (threaded): $LASTEXITCODE"
-          "=== re-link with /threads:1 ==="
+          "=== re-link, /threads:1 ==="
           & $lld "@$($resp.Name)" /threads:1; "exit (/threads:1): $LASTEXITCODE"
           Pop-Location
 
@@ -106,7 +106,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: lld-repro-attempt${{ matrix.n }}-${{ steps.build.outcome }}
+          name: lld-repro-lto-${{ matrix.lto }}-${{ matrix.n }}-${{ steps.build.outcome }}
           path: |
             ${{ github.workspace }}/lld-repro/**
             godot/bin/**

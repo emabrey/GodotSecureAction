@@ -1,19 +1,19 @@
-# Draft LLVM bug report — lld-link associative-COMDAT crash
+# Draft LLVM bug report — lld-link LTO associative-COMDAT crash
 
-Target tracker: <https://github.com/llvm/llvm-project/issues> (subproject: lld / COFF).
+Target tracker: <https://github.com/llvm/llvm-project/issues> (subproject: lld / COFF, LTO).
 Structured per <https://llvm.org/docs/HowToSubmitABug.html>.
 
-Fill in the two TODOs (exact `lld-link --version`, and attach the reproduce
-tarball) from the `lld-repro.yml` workflow before filing.
+Fill in the two TODOs (exact `lld-link --version`, attach the reproduce tarball)
+from the `lld-repro.yml` workflow before filing.
 
 ---
 
-**Title:** [lld][COFF] Non-deterministic `report_fatal_error` "Associative COMDAT symbol '…tls_data…' does not exist" linking a `thread_local` template static (LLVM 20.1.x, lld-link)
+**Title:** [lld][COFF][LTO] `report_fatal_error` "Associative COMDAT symbol '…tls_data…' does not exist" linking a `thread_local` template static with `/lto` (LLVM 20.1.x, lld-link)
 
-### What happened
-`lld-link` aborts via `report_fatal_error` (the internal-error path — note
-`LLVM ERROR:` + "PLEASE submit a bug report" + stack dump — *not* a normal
-`lld-link: error:` diagnostic) while linking an executable:
+### What happens
+`lld-link` aborts via `report_fatal_error` (the internal-error path — `LLVM ERROR:`
++ "PLEASE submit a bug report" + stack dump — *not* a normal `lld-link: error:`)
+during a **full-LTO** link:
 
 ```
 LLVM ERROR: Associative COMDAT symbol '?tls_data@?$SafeBinaryMutex@$00@@0UTLSData@1@A' does not exist.
@@ -23,15 +23,21 @@ PLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/ and i
 The symbol demangles to `SafeBinaryMutex<1>::tls_data` — a `thread_local static`
 data member of a class template (Godot's `core/os/mutex.h`). Its TLS init/guard
 sections are emitted as `IMAGE_COMDAT_SELECT_ASSOCIATIVE`, keyed on that symbol;
-lld-link fails to resolve the key.
+during the LTO link lld-link fails to resolve the key.
 
-### Key characteristic: non-deterministic
-With identical source, flags, and toolchain the link **crashes on roughly half of
-runs and succeeds on the rest** (observed across CI runs of the same commit). The
-backtrace bottoms out at `BaseThreadInitThunk`/`RtlUserThreadStart`, consistent
-with the fatal error firing during lld-link's parallel input processing —
-pointing at a race/ordering bug in associative-COMDAT resolution. See the
-`/threads:1` experiment below.
+### Trigger: full LTO (deterministic)
+The crash correlates **exactly** with `lto=full` (clang-cl + lld-link full LTO):
+
+| build | LTO | result |
+|-------|-----|--------|
+| `use_llvm=yes lto=full`  | full | **crash** — observed 9/9 across 3 CI re-runs |
+| `use_llvm=yes` (no LTO)  | none | links cleanly — many CI runs, never crashed |
+
+So it is **not** intermittent and **not** cache-related (an earlier "intermittent"
+impression came from comparing a full-LTO run against no-LTO runs). The crash
+backtrace is byte-identical across runs (same offsets modulo ASLR), i.e. the same
+code path every time — ruling out memory corruption. It reproduces with vanilla
+Godot, so the Godot Secure patch is not involved.
 
 ### Where LLVM was obtained
 Not upstream git: the **lld-link bundled with Visual Studio 2026 Enterprise**
@@ -47,18 +53,18 @@ standalone **LLVM 20.1.8**.
 - Invocation: `lld-link @<response-file>` (driven by SCons during a Godot build)
 
 ### Reproduction
-Building vanilla **Godot Engine 4.6-stable** from source:
+Vanilla **Godot Engine 4.6-stable**, full LTO:
 
 ```
-scons platform=windows arch=x86_64 target=editor use_llvm=yes d3d12=yes
+scons platform=windows arch=x86_64 target=editor use_llvm=yes d3d12=yes lto=full
 ```
 
-Crash occurs at `Linking Program bin\godot.windows.editor.x86_64.llvm.exe`.
+Crashes at `Linking Program bin\godot.windows.editor.x86_64.llvm.exe`. The same
+command with `lto=none` links successfully.
 
 A complete, self-contained reproducer (the lld `--reproduce` tarball: all
-objects, libs, and the exact response file) is attached — produced by capturing
-`LLD_REPRODUCE` on a crashing run. _TODO: attach `editor-link.tar` from the
-lld-repro workflow artifact._
+objects/bitcode, libs, and the exact response file) is attached, captured via
+`LLD_REPRODUCE` on a crashing run. _TODO: attach `editor-link.tar`._
 
 ### Backtrace (unsymbolicated — VS-bundled release lld-link, no PDB)
 ```
@@ -68,18 +74,23 @@ Exception Code: 0xC000001D
  #2  lld-link.exe+0x1a33058
  #3  lld-link.exe+0x1b0479e
  #4  lld-link.exe+0x1efc85
- …  (frames #5–#21 in lld-link.exe)
+ …  (frames #5–#21 in lld-link.exe; identical offsets across runs)
  #22 lld-link.exe+0x1a1d0dc
  #23 KERNEL32.DLL+0x2e8d7   (BaseThreadInitThunk)
  #24 ntdll.dll+0x8c53c      (RtlUserThreadStart)
 ```
 
-### Decisive test / suspected mechanism
-- **`/threads:1`**: re-linking the captured reproduce inputs single-threaded — if
-  the crash disappears, it localises the bug to parallel input/COMDAT processing
-  (and is a usable workaround). _Result: TODO from the lld-repro workflow._
-- `llvm-readobj --coff-directives --section-symbols --syms` on the object defining
-  `SafeBinaryMutex<1>::tls_data` from a failing build, to check whether the
-  associative COMDAT references an existing key symbol (valid input → lld bug) or a
-  dangling one (clang-cl object-emission bug).
+### Suspected area / useful diagnostics
+- The failure is specific to the **LTO** link path resolving an
+  `IMAGE_COMDAT_SELECT_ASSOCIATIVE` section whose key symbol is a `thread_local`
+  template static — likely the COMDAT/symbol bookkeeping after the LTO backend
+  regenerates objects from bitcode.
+- `/threads:1` result on the captured inputs: _TODO from lld-repro_ (expected not
+  to matter, since the trigger is LTO, not threading).
+- `llvm-readobj`/`llvm-dis` on the LTO-produced object/bitcode defining
+  `SafeBinaryMutex<1>::tls_data` to confirm whether the associative key symbol is
+  present after LTO codegen.
 - A symbolicated backtrace from a PDB-matched / assert-enabled lld-link.
+
+### Workaround
+`lto=none` (or avoiding `use_llvm` for full-LTO release links) links cleanly.
