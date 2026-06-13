@@ -20,6 +20,35 @@ The symbol demangles to `SafeBinaryMutex<1>::tls_data` — a `thread_local stati
 data member of a class template (from Godot's `core/os/mutex.h`). The build links
 cleanly **without** LTO; the crash only appears with `lto=full`.
 
+### Minimal reproducer
+
+The crash is in COFF codegen, so it reproduces directly from a few lines of IR —
+**no LTO, no linker, no source build.** The only requirement is a global in a
+comdat whose named leader `GlobalValue` is absent (the in-module state full LTO
+produces — see below):
+
+```llvm
+; missing.ll
+target triple = "x86_64-pc-windows-msvc"
+
+$missing_leader = comdat any
+@assoc = global i32 0, comdat($missing_leader)   ; member; there is no @missing_leader leader
+```
+
+```
+clang --target=x86_64-pc-windows-msvc -c missing.ll
+```
+
+```
+fatal error: error in backend: Associative COMDAT symbol 'missing_leader' does not exist.
+clang: error: clang frontend command failed with exit code 70
+```
+
+Confirmed on **clang 20.1.8** (`x86_64-pc-windows-msvc`). It crashes identically
+**with and without** `-Xclang -disable-llvm-verifier` — i.e. the IR verifier
+*accepts* the leaderless comdat, so the malformed module reaches the backend,
+which `report_fatal_error`s instead of diagnosing it.
+
 ### Root cause
 
 The message comes from `getComdatGVForCOFF` in
@@ -75,10 +104,12 @@ never handed to codegen:
    GlobalDCE/Internalize already have comdat-group logic; this case (a
    `thread_local` template static's COFF-associated support globals) appears to
    slip through it.
-2. **Fail earlier / more clearly:** the `Verifier` could reject a module where a
-   comdat name has no corresponding `GlobalValue` on COFF, turning a backend
-   `report_fatal_error` into a deterministic verifier error that pinpoints the
-   producing pass. (Defensive only — the real fix is #1.)
+2. **Fail earlier / more clearly:** the IR `Verifier` currently does **not**
+   reject this module — the minimal reproducer above passes verification (crashes
+   with and without `-disable-llvm-verifier`) and only fails in the backend.
+   Having the verifier reject a COFF comdat whose name has no corresponding
+   `GlobalValue` would turn the backend `report_fatal_error` into a deterministic
+   verifier error that pinpoints the producing pass. (Defensive — the real fix is #1.)
 
 Bisecting LTO passes (`-mllvm -print-after-all` / saving the pre-codegen LTO
 bitcode and running `llvm-dis`) on the attached reproducer should identify the
