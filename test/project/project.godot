@@ -5,6 +5,6 @@ config_version=5
 
 [application]
 
-config/name="GodotSecureIntegrationTest"
+config/name="godot_secure_test_project"
 config/features=PackedStringArray("4.6", "Forward Plus")
 config/main_scene="res://main.tscn"

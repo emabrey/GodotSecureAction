@@ -26,6 +26,12 @@ Exit codes:
 import struct
 import sys
 
+# Windows consoles default to a legacy codepage (e.g. cp1252) which cannot
+# encode the ✓/✗ characters used in test output. Force UTF-8 with replacement
+# so the script never crashes with UnicodeEncodeError on any platform.
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 DEFAULT_GODOT_MAGIC = 0x43504447  # "GDPC" in little-endian
 
 
