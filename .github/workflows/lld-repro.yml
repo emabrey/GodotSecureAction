@@ -1,0 +1,114 @@
+name: lld-link COMDAT crash repro
+
+# One-off diagnostic workflow (manual dispatch only).
+#
+# Captures a self-contained reproducer for the intermittent lld-link crash
+#   LLVM ERROR: Associative COMDAT symbol
+#   '?tls_data@?$SafeBinaryMutex@$00@@0UTLSData@1@A' does not exist.
+# observed when linking Godot with use_llvm (clang-cl + lld-link) on the
+# windows-2025-vs2026 image (VS 2026, LLVM ~20.1.x).
+#
+# Design:
+#   * Builds VANILLA Godot (no Godot Secure patch) so the reproducer is 100%
+#     public and the LLVM maintainers can reproduce it themselves.
+#   * LLD_REPRODUCE makes every lld-link invocation write a complete input
+#     tarball (objects + libs + the exact response file) — the reducible
+#     reproducer the LLVM bug guide asks for. The editor links first, so on a
+#     crash the build stops and the tarball on disk is the crashing link.
+#   * scons cache is intentionally OFF: the crash needs objects freshly emitted
+#     by the current clang; a warm cache of older objects masks it.
+#   * Several identical attempts run in parallel because the crash is ~50%.
+#   * On a crash we re-link the captured inputs with /threads:1 to test whether
+#     serialising lld-link's parallel COMDAT resolution avoids the crash — both
+#     a confirming experiment and a potential workaround.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    name: attempt ${{ matrix.n }}
+    runs-on: windows-latest          # currently windows-2025-vs2026
+    strategy:
+      fail-fast: false
+      matrix:
+        n: [1, 2, 3, 4, 5, 6]        # ~50% crash rate -> 6 attempts ≈ 98% chance of >=1 crash
+
+    env:
+      GODOT_REF: 4.6-stable
+      LLD_REPRODUCE: ${{ github.workspace }}\lld-repro\editor-link.tar
+
+    steps:
+      - name: Toolchain + image versions (for the bug report)
+        shell: pwsh
+        run: |
+          "Image: $env:ImageOS  $env:ImageVersion"
+          $lld = "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\Llvm\x64\bin\lld-link.exe"
+          if (Test-Path $lld) {
+            & $lld --version
+            & (Join-Path (Split-Path $lld) 'clang-cl.exe') --version
+          } else {
+            "lld-link not at the expected VS 2026 path; searching PATH"
+            (Get-Command lld-link -ErrorAction SilentlyContinue).Source
+          }
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+
+      - name: Install SCons
+        run: pip install scons
+
+      - name: Download vanilla Godot ${{ env.GODOT_REF }}
+        shell: bash
+        run: |
+          curl -fL --retry 5 --retry-delay 10 \
+            "https://github.com/godotengine/godot/archive/refs/tags/${GODOT_REF}.tar.gz" -o godot.tar.gz
+          mkdir godot && tar -xzf godot.tar.gz --strip-components=1 -C godot
+
+      - name: Install D3D12 SDK
+        working-directory: godot
+        run: python misc/scripts/install_d3d12_sdk_windows.py
+
+      - name: Build editor with clang (use_llvm) and capture lld reproduce
+        id: build
+        continue-on-error: true
+        working-directory: godot
+        shell: bash
+        run: |
+          mkdir -p "$(dirname "$LLD_REPRODUCE")"
+          JOBS=$(nproc 2>/dev/null || echo 2)
+          scons platform=windows arch=x86_64 target=editor \
+            use_llvm=yes d3d12=yes verbose=yes -j"$JOBS"
+
+      - name: On crash — re-link single-threaded (/threads:1) to test the race
+        if: steps.build.outcome == 'failure'
+        shell: pwsh
+        run: |
+          $tar = $env:LLD_REPRODUCE
+          if (-not (Test-Path $tar)) { "No reproduce tarball at $tar (lld-link may not have honoured LLD_REPRODUCE)."; exit 0 }
+          $dir = "repro-extract"; New-Item -ItemType Directory -Force $dir | Out-Null
+          tar -xf $tar -C $dir
+          $resp = Get-ChildItem $dir -Recurse -Filter 'response.txt' | Select-Object -First 1
+          if (-not $resp) { "No response.txt inside the reproduce tarball."; exit 0 }
+          $lld = "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\Llvm\x64\bin\lld-link.exe"
+          Push-Location $resp.Directory
+          "=== re-link with default (threaded) to confirm crash reproduces from the tarball ==="
+          & $lld "@$($resp.Name)"; "exit (threaded): $LASTEXITCODE"
+          "=== re-link with /threads:1 ==="
+          & $lld "@$($resp.Name)" /threads:1; "exit (/threads:1): $LASTEXITCODE"
+          Pop-Location
+
+      - name: Upload reproducer (lld tarball + build output)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: lld-repro-attempt${{ matrix.n }}-${{ steps.build.outcome }}
+          path: |
+            ${{ github.workspace }}/lld-repro/**
+            godot/bin/**
+          if-no-files-found: warn
+          retention-days: 14
