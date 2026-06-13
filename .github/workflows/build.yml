@@ -347,9 +347,17 @@ jobs:
 
       - name: Download gdsdecomp
         shell: bash
+        env:
+          # Authenticate the GitHub API call. Unauthenticated requests are
+          # capped at 60/hour per runner IP, which the 9-job integration matrix
+          # exhausts (intermittent 403s on releases/latest). GITHUB_TOKEN raises
+          # the limit to 15000/hour and scopes it to the repo, not the shared IP.
+          GH_TOKEN: ${{ github.token }}
         run: |
           RUNNER_OS="${{ runner.os }}"
-          RELEASE_JSON=$(curl -fsSL --retry 5 --retry-delay 10 https://api.github.com/repos/bruvzg/gdsdecomp/releases/latest)
+          RELEASE_JSON=$(curl -fsSL --retry 5 --retry-delay 10 \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/bruvzg/gdsdecomp/releases/latest)
 
           echo "Available gdsdecomp release assets:"
           echo "$RELEASE_JSON" | python3 -c "
