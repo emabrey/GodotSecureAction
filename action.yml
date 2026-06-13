@@ -402,7 +402,15 @@ runs:
             PLATFORM_ARGS="vulkan_sdk_path=${VULKAN_PATH}"
             ;;
           Windows)
-            PLATFORM_ARGS="d3d12=yes"
+            # Build with clang (use_llvm) rather than MSVC. MSVC's default /Zi
+            # debug model writes debug info to a separate shared PDB, so its .obj
+            # files are not self-contained and SCons CacheDir cannot reuse them
+            # across runs — measured at 0% hit rate, forcing a full ~2h rebuild
+            # every time. clang embeds CodeView debug info in the object (like
+            # gcc/clang on Linux/macOS, where the cache already works), which
+            # raised the Windows cache hit rate to ~95% and cut the warm build
+            # from ~2h to ~8min. d3d12=yes links fine under clang-cl.
+            PLATFORM_ARGS="d3d12=yes use_llvm=yes"
             ;;
         esac
         echo "platform-args=$PLATFORM_ARGS" >> "$GITHUB_OUTPUT"
