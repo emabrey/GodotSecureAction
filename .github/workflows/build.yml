@@ -79,14 +79,9 @@ jobs:
           security-token:    ${{ needs.setup.outputs.security-token }}
           target:            all
           scons-cache:       true
-          # Build Windows with clang instead of MSVC. MSVC's default /Zi debug
-          # model writes debug info to a separate shared PDB, so its .obj files
-          # are not self-contained and SCons CacheDir never reuses them across
-          # runs (observed: 0 of 7612 objects retrieved on a warm Windows cache,
-          # forcing a ~2h cold rebuild every run). clang embeds CodeView debug
-          # info in the object — like gcc/clang on Linux/macOS where the cache
-          # already hits — so this should let the Windows cache start working.
-          extra-scons-args: ${{ matrix.os == 'windows-latest' && 'use_llvm=yes' || '' }}
+          # Windows now builds with clang by default (use_llvm) inside the
+          # action itself — see the platform-args step in action.yml — so no
+          # per-workflow override is needed here.
 
       - name: Upload Godot Secure log
         if: always()
