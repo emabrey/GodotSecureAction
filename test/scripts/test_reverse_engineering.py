@@ -43,6 +43,10 @@ def find_tool(tool_dir: str) -> str:
         os.path.join(tool_dir, "**", "gdre_tools.exe"),
         os.path.join(tool_dir, "**", "recover_project"),
         os.path.join(tool_dir, "**", "recover_project.exe"),
+        # macOS ships a .app bundle; the CLI-capable binary lives inside it and
+        # may have a display name with spaces (e.g. "Godot RE Tools"), so match
+        # any executable in <bundle>.app/Contents/MacOS/ rather than by name.
+        os.path.join(tool_dir, "**", "*.app", "Contents", "MacOS", "*"),
         os.path.join(tool_dir, "gdre_tools"),
         os.path.join(tool_dir, "gdre_tools.exe"),
         os.path.join(tool_dir, "recover_project"),
