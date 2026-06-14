@@ -6,6 +6,34 @@ The resulting binaries replace the official Godot editor and export templates an
 
 ---
 
+## Verifying with the Estragon example project
+
+[Estragon](https://github.com/emabrey/estragon) is an open-source Godot 4 project template that uses GodotSecureAction for its CI builds. Its PCK encryption key is published intentionally so anyone can verify that the encryption pipeline works end to end.
+
+> **This is the only situation in which publishing a GodotSecure key is appropriate.** Estragon is a template whose sole purpose is to demonstrate the toolchain. For any real game, treat your encryption key as a secret — store it exclusively in a GitHub Actions secret and never commit it to source control. A leaked key lets anyone decrypt your exported PCK files and extract your game's assets and scripts.
+
+### Example key
+
+```
+7740b801d92b9a201af5650dad9054f6d52de047992c44df5a633b9c0953a149
+```
+
+### How to verify
+
+1. Clone the [Estragon repository](https://github.com/emabrey/estragon) and open it in a Godot editor built with GodotSecureAction (any cipher, any OS build from the published artifacts).
+
+2. In the Godot editor, go to **Project → Export**, select any export preset, open the **Resources** tab, and enter the key above in the **Script encryption key** field.
+
+3. Export the project. The resulting PCK file was encrypted with this key at build time; if your editor binary was built with the same key, the export and re-import will succeed without errors.
+
+4. To confirm the key is actually enforced, repeat the export using a different key — the Godot editor will fail to open the resulting PCK, proving that encryption is active.
+
+### How Estragon stores its key locally
+
+Estragon's `vendored_godot_build.ps1` prompts for the key on first run and stores it as a Windows DPAPI-encrypted blob in `godot.gdkey`. DPAPI ties the blob to the local Windows user account, so the file is useless to anyone who obtains it without access to that account. The plaintext key above is what the build script decrypts from that file at build time and passes to SCons via `SCRIPT_AES256_ENCRYPTION_KEY`.
+
+---
+
 ## Quick start
 
 ### 1. Add an encryption key secret
