@@ -126,6 +126,13 @@ outputs:
     description: Absolute path to the downloaded godot_secure.py.
     value: ${{ steps.fetch-godot-secure.outputs.script-path }}
 
+  godot-version-string:
+    description: >
+      Version string for the Godot export_templates directory, e.g. "4.6.4.rc"
+      or "4.6.0.stable". Append ".mono" when the build includes module_mono_enabled=yes.
+      Use this to locate the correct templates directory without hardcoding versions.
+    value: ${{ steps.locate-bins.outputs.godot-version-string }}
+
   editor-path:
     description: Absolute path to the compiled editor binary (if built).
     value: ${{ steps.locate-bins.outputs.editor-path }}
@@ -556,6 +563,16 @@ runs:
         echo "editor-path=$EDITOR_PATH"            >> "$GITHUB_OUTPUT"
         echo "template-debug-path=$DEBUG_PATH"     >> "$GITHUB_OUTPUT"
         echo "template-release-path=$RELEASE_PATH" >> "$GITHUB_OUTPUT"
+
+        # Emit the version string used for the export_templates directory,
+        # e.g. "4.6.4.rc.mono" or "4.6.0.stable" (no .mono when built without
+        # module_mono_enabled=yes — callers must append it when needed).
+        VERSION_STR=$(python3 -c "
+d = {}
+exec(open('$GITHUB_WORKSPACE/${{ inputs.godot-source }}/version.py').read(), d)
+print(f\"{d['major']}.{d['minor']}.{d['patch']}.{d['status']}\")" 2>/dev/null || echo "")
+        echo "godot-version-string=$VERSION_STR" >> "$GITHUB_OUTPUT"
+        [ -n "$VERSION_STR" ] && echo "  version string  : $VERSION_STR"
 
         echo "── Compiled binaries ──────────────────────────────────────────"
         [ -n "$EDITOR_PATH"   ] && echo "  editor          : $EDITOR_PATH"
